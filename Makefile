@@ -123,6 +123,7 @@ mkdirs:
 	@mkdir -p $(obj)/src/lib/efhw
 	@mkdir -p $(obj)/src/lib/efrm
 	@mkdir -p $(obj)/src/lib/efthrm
+	@mkdir -p $(obj)/src/lib/kernel_utils
 
 # Define the high-level dependencies between libraries:
 $(obj)/src/driver/linux_resource: $(AUTOCOMPAT) mkdirs
