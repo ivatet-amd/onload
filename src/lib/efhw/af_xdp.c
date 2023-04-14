@@ -24,6 +24,8 @@
 #include <ci/efrm/syscall.h>
 #include <ci/efrm/efrm_filter.h>
 
+#include <kernel_utils/hugetlb.h>
+
 #include "ethtool_rxclass.h"
 #include "ethtool_flow.h"
 
@@ -178,6 +180,7 @@ struct efhw_nic_af_xdp
   struct file* map;
   struct efhw_af_xdp_vi* vi;
   struct protection_domain* pd;
+  struct hugetlb_allocator *hugetlb_alloc;
 };
 
 
@@ -238,10 +241,12 @@ static void umem_pages_set_addr(struct umem_pages* pages, long page, void* addr)
     pages->used_page_count = page;
 }
 
+#if 0
 static void* umem_pages_get_addr(struct umem_pages* pages, long page)
 {
   return *umem_pages_addr_ptr(pages, page);
 }
+#endif
 
 /*----------------------------------------------------------------------------
  *
@@ -488,6 +493,7 @@ static int xdp_set_link(struct net_device* dev, int prog_fd)
   }
 }
 
+#if 0
 /* Fault handler to provide buffer memory pages for our user mapping */
 static vm_fault_t xdp_umem_fault(struct vm_fault* vmf) {
   struct umem_pages* pages = vmf->vma->vm_private_data;
@@ -518,12 +524,17 @@ static vm_fault_t xdp_umem_fault(struct vm_fault* vmf) {
 static struct vm_operations_struct vm_ops = {
   .fault = xdp_umem_fault
 };
+#endif
 
 /* Register user memory with an XDP socket */
-static int xdp_register_umem(struct socket* sock, struct umem_pages* pages,
+static int xdp_register_umem(struct efhw_nic_af_xdp* af_xdp,
+                             struct socket* sock, struct umem_pages* pages,
                              int chunk_size, int headroom)
 {
+#if 0
   struct vm_area_struct* vma;
+#endif
+  struct hugetlb_page page;
   int rc = -EFAULT;
 
   /* The actual fields present in this struct vary with kernel version, with
@@ -531,15 +542,24 @@ static int xdp_register_umem(struct socket* sock, struct umem_pages* pages,
    * so just zero everything we don't use.
    */
   struct xdp_umem_reg mr = {
-    .len = pages->used_page_count << PAGE_SHIFT,
+    .len = HUGEPAGE_SIZE,
     .chunk_size = chunk_size,
     .headroom = headroom
   };
 
-  mr.addr = vm_mmap(NULL, 0, mr.len, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
+  EFRM_ERR("%s: About to call hugetlb_page_alloc()", __func__);
+  rc = hugetlb_page_alloc(af_xdp->hugetlb_alloc, &page);
+  if( rc ) {
+    EFRM_ERR("%s: Unable to allocate hugepages for umem rc=%d", __func__, rc);
+    return rc;
+  }
+
+  mr.addr = vm_mmap(page.filp, 0, HUGEPAGE_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, page.page->index * HUGEPAGE_SIZE);
   if( offset_in_page(mr.addr) )
     return mr.addr;
 
+#if 0
   /* linux>=5.8 uses mmap_write_lock() */
   mmap_write_lock(current->mm);
   vma = find_vma(current->mm, mr.addr);
@@ -550,11 +570,13 @@ static int xdp_register_umem(struct socket* sock, struct umem_pages* pages,
 
   vma->vm_private_data = pages;
   vma->vm_ops = &vm_ops;
+#endif
 
   rc = sock_ops_setsockopt(sock, SOL_XDP, XDP_UMEM_REG,
                            (char*)&mr, sizeof(mr));
 
   vm_munmap(mr.addr, mr.len);
+
   return rc;
 }
 
@@ -570,7 +592,7 @@ static int xdp_create_ring(struct socket* sock,
   unsigned long map_size, addr, pfn, pages;
   int64_t user_base, kern_base;
   struct vm_area_struct* vma;
-  void* ring_base;
+  void* ring_base = NULL;
 
   user_base = page_map->n_pages << PAGE_SHIFT;
 
@@ -806,7 +828,7 @@ static int af_xdp_init(struct efhw_nic* nic, int instance,
   if( rc < 0 )
     goto out_free_user_offsets;
 
-  rc = xdp_register_umem(sock, &pd->umem, chunk_size, headroom);
+  rc = xdp_register_umem(nic->arch_extra, sock, &pd->umem, chunk_size, headroom);
   if( rc < 0 )
     goto out_free_user_offsets;
 
@@ -985,6 +1007,14 @@ __af_xdp_nic_init_hardware(struct efhw_nic *nic,
 	xdp->vi = (struct efhw_af_xdp_vi*) (xdp + 1);
 	xdp->pd = (struct protection_domain*) (xdp->vi + nic->vi_lim);
 
+	xdp->hugetlb_alloc = hugetlb_allocator_create(-1);
+	if( IS_ERR(xdp->hugetlb_alloc) ) {
+		rc = PTR_ERR(xdp->hugetlb_alloc);
+		/* nr_hugepages must be non-zero to succeed. */
+		EFHW_ERR("%s: Could not create allocator rc=%d", __func__);
+		goto fail_hugetlb;
+	}
+
 	rc = map_fd = xdp_map_create(sys_call_area, nic->vi_lim);
 	if( rc < 0 )
 		goto fail_map;
@@ -1011,6 +1041,8 @@ __af_xdp_nic_init_hardware(struct efhw_nic *nic,
 fail:
 	ci_close_fd(map_fd);
 fail_map:
+	hugetlb_allocator_put(xdp->hugetlb_alloc);
+fail_hugetlb:
 	kfree(xdp);
 	return rc;
 }
@@ -1040,6 +1072,7 @@ af_xdp_nic_release_hardware(struct efhw_nic* nic)
   xdp_set_link(nic->net_dev, -1);
   if( xdp ) {
     fput(xdp->map);
+    hugetlb_allocator_put(xdp->hugetlb_alloc);
     kfree(xdp);
   }
 }
